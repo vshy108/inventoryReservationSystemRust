@@ -81,6 +81,34 @@ impl ReservationService {
         })
     }
 
+    pub fn confirm_reservation(
+        &self,
+        _reservation_id: &str,
+        _now: DateTime<Utc>,
+    ) -> Result<Reservation, ReservationError> {
+        todo!("L2 GREEN: implement confirm_reservation")
+    }
+
+    pub fn cancel_reservation(
+        &self,
+        _reservation_id: &str,
+        _now: DateTime<Utc>,
+    ) -> Result<Reservation, ReservationError> {
+        todo!("L2 GREEN: implement cancel_reservation")
+    }
+
+    pub fn expire_reservations(&self, _now: DateTime<Utc>) -> Result<usize, ReservationError> {
+        todo!("L2 GREEN: implement expire_reservations")
+    }
+
+    pub fn get_reservation(&self, _reservation_id: &str) -> Option<Reservation> {
+        todo!("L2 GREEN: implement get_reservation")
+    }
+
+    pub fn get_available_stock(&self, _product_id: &str) -> Result<u32, ReservationError> {
+        todo!("L2 GREEN: implement get_available_stock")
+    }
+
     fn next_reservation_id(&self) -> String {
         let n = self.next_id.fetch_add(1, Ordering::Relaxed);
         format!("rsv-{n}")

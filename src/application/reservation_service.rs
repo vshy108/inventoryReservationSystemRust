@@ -58,6 +58,7 @@ type ProductLock = Arc<Mutex<ProductState>>;
 ///   global mutex.
 /// - Lock discipline: at most one product mutex is held at any instant
 ///   (the index is read-only by the time the product mutex is taken).
+#[derive(Debug)]
 pub struct ReservationService {
     products: DashMap<String, ProductLock>,
     reservation_index: DashMap<String, String>,

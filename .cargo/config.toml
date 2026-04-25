@@ -1,0 +1,12 @@
+[alias]
+# Library coverage summary, excluding the smoke binary src/bin/stress.rs.
+# Usage: cargo cov-lib
+cov-lib = "llvm-cov --lib --tests --ignore-filename-regex bin/stress --summary-only"
+
+# Full coverage (includes stress binary at 0% — useful for total picture).
+# Usage: cargo cov
+cov = "llvm-cov --summary-only"
+
+# HTML report (open target/llvm-cov/html/index.html after).
+# Usage: cargo cov-html
+cov-html = "llvm-cov --lib --tests --ignore-filename-regex bin/stress --html"

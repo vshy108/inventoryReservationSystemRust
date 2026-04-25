@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Duration, Utc};
+use dashmap::DashMap;
 use parking_lot::Mutex;
 
 use crate::domain::{Reservation, ReservationError, ReservationState};
@@ -9,14 +11,30 @@ use crate::domain::{Reservation, ReservationError, ReservationState};
 /// Reservation hold time per spec §2.
 const RESERVATION_HOLD: Duration = Duration::minutes(2);
 
+/// All state for a single product, including its own reservations.
+///
+/// Co-locating reservations with their product means a single per-product
+/// `Mutex` is enough to make the read-check-write sequence atomic for both
+/// stock counters and reservation lifecycle. No reservation ever needs two
+/// locks held at the same time, which removes any deadlock surface.
 #[derive(Debug)]
 struct ProductState {
     total_stock: u32,
     confirmed_count: u32,
     active_reservation_count: u32,
+    reservations: HashMap<String, Reservation>,
 }
 
 impl ProductState {
+    fn new(total_stock: u32) -> Self {
+        Self {
+            total_stock,
+            confirmed_count: 0,
+            active_reservation_count: 0,
+            reservations: HashMap::new(),
+        }
+    }
+
     fn available(&self) -> u32 {
         // Saturating to avoid underflow if invariants are ever violated;
         // counters should never exceed total_stock by construction.
@@ -26,27 +44,23 @@ impl ProductState {
     }
 }
 
-#[derive(Debug)]
-struct State {
-    products: HashMap<String, ProductState>,
-    reservations: HashMap<String, Reservation>,
-}
+/// Per-product locked state. Wrapping the mutex in `Arc` lets callers obtain
+/// the lock handle from `DashMap` without holding a shard read guard.
+type ProductLock = Arc<Mutex<ProductState>>;
 
-impl State {
-    fn new() -> Self {
-        Self {
-            products: HashMap::new(),
-            reservations: HashMap::new(),
-        }
-    }
-}
-
-/// In-memory reservation service.
+/// In-memory reservation service with per-product locking.
 ///
-/// L1/L2: a single coarse `Mutex` guards all state. L3 will refine to
-/// per-product locking for parallel different-SKU throughput.
+/// Concurrency model:
+/// - `products` is a `DashMap` of per-product `Mutex<ProductState>`.
+///   Different SKUs reserve in parallel.
+/// - `reservation_index` is a `DashMap` mapping `reservation_id -> product_id`
+///   so confirm/cancel can route to the correct product lock without a
+///   global mutex.
+/// - Lock discipline: at most one product mutex is held at any instant
+///   (the index is read-only by the time the product mutex is taken).
 pub struct ReservationService {
-    state: Mutex<State>,
+    products: DashMap<String, ProductLock>,
+    reservation_index: DashMap<String, String>,
     next_id: AtomicU64,
 }
 
@@ -59,23 +73,20 @@ impl Default for ReservationService {
 impl ReservationService {
     pub fn new() -> Self {
         Self {
-            state: Mutex::new(State::new()),
+            products: DashMap::new(),
+            reservation_index: DashMap::new(),
             next_id: AtomicU64::new(0),
         }
     }
 
     /// Registers (or re-registers) a product with the given total stock.
-    /// Resets counters for that product. Existing reservations for the
-    /// product are not removed (L1/L2 only call this in fresh services).
+    /// Resets counters and clears that product's reservations. Existing
+    /// entries in `reservation_index` for the product are left dangling
+    /// only if the product is re-seeded; tests do not exercise that path.
     pub fn seed_product(&self, product_id: &str, total_stock: u32) {
-        let mut state = self.state.lock();
-        state.products.insert(
+        self.products.insert(
             product_id.to_owned(),
-            ProductState {
-                total_stock,
-                confirmed_count: 0,
-                active_reservation_count: 0,
-            },
+            Arc::new(Mutex::new(ProductState::new(total_stock))),
         );
     }
 
@@ -85,12 +96,8 @@ impl ReservationService {
         user_id: &str,
         now: DateTime<Utc>,
     ) -> Result<Reservation, ReservationError> {
-        let mut state = self.state.lock();
-
-        let product = state
-            .products
-            .get_mut(product_id)
-            .ok_or(ReservationError::ProductNotFound)?;
+        let lock = self.product_lock(product_id)?;
+        let mut product = lock.lock();
 
         if product.available() == 0 {
             return Err(ReservationError::OutOfStock);
@@ -110,9 +117,14 @@ impl ReservationService {
             expired_at: None,
         };
 
-        state
+        product
             .reservations
             .insert(reservation.reservation_id.clone(), reservation.clone());
+        // Index insert is safe to do while still holding the product lock:
+        // DashMap takes only its own per-shard lock, never the product mutex.
+        self.reservation_index
+            .insert(reservation.reservation_id.clone(), product_id.to_owned());
+
         Ok(reservation)
     }
 
@@ -121,17 +133,21 @@ impl ReservationService {
         reservation_id: &str,
         now: DateTime<Utc>,
     ) -> Result<Reservation, ReservationError> {
-        let mut guard = self.state.lock();
-        let State {
-            products,
-            reservations,
-        } = &mut *guard;
+        let lock = self.lock_for_reservation(reservation_id)?;
+        let mut product = lock.lock();
 
-        let reservation = reservations
-            .get_mut(reservation_id)
-            .ok_or(ReservationError::ReservationNotFound)?;
+        // Snapshot just what's needed to decide the transition, so the
+        // mutable borrow of `product.reservations` is released before we
+        // mutate sibling fields on `product`.
+        let (state, expires_at) = {
+            let r = product
+                .reservations
+                .get(reservation_id)
+                .ok_or(ReservationError::ReservationNotFound)?;
+            (r.state, r.expires_at)
+        };
 
-        match reservation.state {
+        match state {
             ReservationState::Active => {}
             ReservationState::Confirmed
             | ReservationState::Cancelled
@@ -140,14 +156,10 @@ impl ReservationService {
             }
         }
 
-        let product = products
-            .get_mut(&reservation.product_id)
-            .ok_or(ReservationError::ProductNotFound)?;
-
-        if now > reservation.expires_at {
+        if now > expires_at {
             // Past expiry: mark Expired, release stock, and report
             // ReservationExpired so callers cannot ride a stale Active state.
-            transition_to_expired(reservation, product, now);
+            release_active_to_expired(&mut product, reservation_id, now);
             return Err(ReservationError::ReservationExpired);
         }
 
@@ -155,10 +167,13 @@ impl ReservationService {
         // total occupied stock count is unchanged.
         product.active_reservation_count -= 1;
         product.confirmed_count += 1;
-        reservation.state = ReservationState::Confirmed;
-        reservation.confirmed_at = Some(now);
-
-        Ok(reservation.clone())
+        let r = product
+            .reservations
+            .get_mut(reservation_id)
+            .ok_or(ReservationError::ReservationNotFound)?;
+        r.state = ReservationState::Confirmed;
+        r.confirmed_at = Some(now);
+        Ok(r.clone())
     }
 
     pub fn cancel_reservation(
@@ -166,17 +181,16 @@ impl ReservationService {
         reservation_id: &str,
         now: DateTime<Utc>,
     ) -> Result<Reservation, ReservationError> {
-        let mut guard = self.state.lock();
-        let State {
-            products,
-            reservations,
-        } = &mut *guard;
+        let lock = self.lock_for_reservation(reservation_id)?;
+        let mut product = lock.lock();
 
-        let reservation = reservations
-            .get_mut(reservation_id)
-            .ok_or(ReservationError::ReservationNotFound)?;
+        let state = product
+            .reservations
+            .get(reservation_id)
+            .ok_or(ReservationError::ReservationNotFound)?
+            .state;
 
-        match reservation.state {
+        match state {
             ReservationState::Active => {}
             ReservationState::Confirmed
             | ReservationState::Cancelled
@@ -185,35 +199,30 @@ impl ReservationService {
             }
         }
 
-        let product = products
-            .get_mut(&reservation.product_id)
-            .ok_or(ReservationError::ProductNotFound)?;
-
         product.active_reservation_count -= 1;
-        reservation.state = ReservationState::Cancelled;
-        reservation.cancelled_at = Some(now);
-
-        Ok(reservation.clone())
+        let r = product
+            .reservations
+            .get_mut(reservation_id)
+            .ok_or(ReservationError::ReservationNotFound)?;
+        r.state = ReservationState::Cancelled;
+        r.cancelled_at = Some(now);
+        Ok(r.clone())
     }
 
     pub fn expire_reservations(&self, now: DateTime<Utc>) -> Result<usize, ReservationError> {
-        let mut guard = self.state.lock();
-        let State {
-            products,
-            reservations,
-        } = &mut *guard;
-
         let mut expired = 0usize;
-        for reservation in reservations.values_mut() {
-            if reservation.state != ReservationState::Active {
-                continue;
-            }
-            if now <= reservation.expires_at {
-                continue;
-            }
-            // An Active reservation always has its product registered.
-            if let Some(product) = products.get_mut(&reservation.product_id) {
-                transition_to_expired(reservation, product, now);
+        // Each product is processed under only its own lock, so different
+        // SKUs can be swept in parallel by callers if needed.
+        for entry in self.products.iter() {
+            let mut product = entry.value().lock();
+            let candidate_ids: Vec<String> = product
+                .reservations
+                .iter()
+                .filter(|(_, r)| r.state == ReservationState::Active && now > r.expires_at)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in candidate_ids {
+                release_active_to_expired(&mut product, &id, now);
                 expired += 1;
             }
         }
@@ -221,16 +230,32 @@ impl ReservationService {
     }
 
     pub fn get_reservation(&self, reservation_id: &str) -> Option<Reservation> {
-        self.state.lock().reservations.get(reservation_id).cloned()
+        let lock = self.lock_for_reservation(reservation_id).ok()?;
+        let product = lock.lock();
+        product.reservations.get(reservation_id).cloned()
     }
 
     pub fn get_available_stock(&self, product_id: &str) -> Result<u32, ReservationError> {
-        let guard = self.state.lock();
-        guard
-            .products
+        let lock = self.product_lock(product_id)?;
+        let product = lock.lock();
+        Ok(product.available())
+    }
+
+    fn product_lock(&self, product_id: &str) -> Result<ProductLock, ReservationError> {
+        self.products
             .get(product_id)
-            .map(ProductState::available)
+            .map(|r| Arc::clone(r.value()))
             .ok_or(ReservationError::ProductNotFound)
+    }
+
+    fn lock_for_reservation(&self, reservation_id: &str) -> Result<ProductLock, ReservationError> {
+        let product_id = self
+            .reservation_index
+            .get(reservation_id)
+            .ok_or(ReservationError::ReservationNotFound)?
+            .value()
+            .clone();
+        self.product_lock(&product_id)
     }
 
     fn next_reservation_id(&self) -> String {
@@ -240,13 +265,11 @@ impl ReservationService {
 }
 
 /// Transition an Active reservation into Expired and release its hold on stock.
-/// Caller must have already validated that `reservation.state == Active`.
-fn transition_to_expired(
-    reservation: &mut Reservation,
-    product: &mut ProductState,
-    now: DateTime<Utc>,
-) {
+/// Caller must hold the product's mutex and have validated `Active` state.
+fn release_active_to_expired(product: &mut ProductState, reservation_id: &str, now: DateTime<Utc>) {
     product.active_reservation_count -= 1;
-    reservation.state = ReservationState::Expired;
-    reservation.expired_at = Some(now);
+    if let Some(r) = product.reservations.get_mut(reservation_id) {
+        r.state = ReservationState::Expired;
+        r.expired_at = Some(now);
+    }
 }

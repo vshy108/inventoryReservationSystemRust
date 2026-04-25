@@ -104,6 +104,7 @@ impl ReservationService {
     /// # Errors
     /// * [`ReservationError::ProductNotFound`] if the product was never seeded.
     /// * [`ReservationError::OutOfStock`] if `available_stock == 0`.
+    #[must_use = "the returned Reservation owns the held unit; dropping the id without confirm/cancel will leak stock until it expires"]
     pub fn reserve_item(
         &self,
         product_id: &str,
@@ -150,6 +151,7 @@ impl ReservationService {
     /// * [`ReservationError::ReservationExpired`] if `now > expires_at`. As a side
     ///   effect, the reservation is transitioned to `Expired` and stock is released,
     ///   so callers cannot retry-and-confirm a stale `Active` reservation.
+    #[must_use = "the Result encodes ReservationExpired / AlreadyFinalized / NotFound; ignoring it can hide a billing bug"]
     pub fn confirm_reservation(
         &self,
         reservation_id: &str,
@@ -203,6 +205,7 @@ impl ReservationService {
     /// # Errors
     /// * [`ReservationError::ReservationNotFound`] if the id is unknown.
     /// * [`ReservationError::ReservationAlreadyFinalized`] if already in a terminal state.
+    #[must_use = "the Result encodes AlreadyFinalized / NotFound; ignoring it can hide a state-machine bug"]
     pub fn cancel_reservation(
         &self,
         reservation_id: &str,

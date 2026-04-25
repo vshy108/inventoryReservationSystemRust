@@ -71,6 +71,7 @@ impl Default for ReservationService {
 }
 
 impl ReservationService {
+    /// Constructs an empty service with no products registered.
     pub fn new() -> Self {
         Self {
             products: DashMap::new(),
@@ -97,6 +98,12 @@ impl ReservationService {
         );
     }
 
+    /// Reserves one unit of `product_id` for `user_id`, returning a fresh
+    /// `Active` [`Reservation`] with `expires_at = now + RESERVATION_HOLD`.
+    ///
+    /// # Errors
+    /// * [`ReservationError::ProductNotFound`] if the product was never seeded.
+    /// * [`ReservationError::OutOfStock`] if `available_stock == 0`.
     pub fn reserve_item(
         &self,
         product_id: &str,
@@ -135,6 +142,14 @@ impl ReservationService {
         Ok(reservation)
     }
 
+    /// Transitions an `Active` reservation to `Confirmed`.
+    ///
+    /// # Errors
+    /// * [`ReservationError::ReservationNotFound`] if the id is unknown.
+    /// * [`ReservationError::ReservationAlreadyFinalized`] if already in a terminal state.
+    /// * [`ReservationError::ReservationExpired`] if `now > expires_at`. As a side
+    ///   effect, the reservation is transitioned to `Expired` and stock is released,
+    ///   so callers cannot retry-and-confirm a stale `Active` reservation.
     pub fn confirm_reservation(
         &self,
         reservation_id: &str,
@@ -183,6 +198,11 @@ impl ReservationService {
         Ok(r.clone())
     }
 
+    /// Transitions an `Active` reservation to `Cancelled`, releasing the held unit.
+    ///
+    /// # Errors
+    /// * [`ReservationError::ReservationNotFound`] if the id is unknown.
+    /// * [`ReservationError::ReservationAlreadyFinalized`] if already in a terminal state.
     pub fn cancel_reservation(
         &self,
         reservation_id: &str,
@@ -216,6 +236,12 @@ impl ReservationService {
         Ok(r.clone())
     }
 
+    /// Sweeps every product, transitioning `Active` reservations whose
+    /// `expires_at < now` to `Expired` and releasing their stock. Returns
+    /// the count of newly-expired reservations across all products.
+    ///
+    /// Each product is processed under only its own lock, so SKUs can be
+    /// swept without blocking each other.
     pub fn expire_reservations(&self, now: DateTime<Utc>) -> Result<usize, ReservationError> {
         let mut expired = 0usize;
         // Each product is processed under only its own lock, so different
@@ -236,12 +262,19 @@ impl ReservationService {
         Ok(expired)
     }
 
+    /// Returns a snapshot of the reservation, or `None` if the id is unknown.
     pub fn get_reservation(&self, reservation_id: &str) -> Option<Reservation> {
         let lock = self.lock_for_reservation(reservation_id).ok()?;
         let product = lock.lock();
         product.reservations.get(reservation_id).cloned()
     }
 
+    /// Computes `total_stock - confirmed_count - active_reservation_count`
+    /// for `product_id`. Saturates at zero if invariants are ever violated
+    /// (which they should not be, by construction).
+    ///
+    /// # Errors
+    /// * [`ReservationError::ProductNotFound`] if the product was never seeded.
     pub fn get_available_stock(&self, product_id: &str) -> Result<u32, ReservationError> {
         let lock = self.product_lock(product_id)?;
         let product = lock.lock();

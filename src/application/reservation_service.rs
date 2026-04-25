@@ -80,10 +80,17 @@ impl ReservationService {
     }
 
     /// Registers (or re-registers) a product with the given total stock.
-    /// Resets counters and clears that product's reservations. Existing
-    /// entries in `reservation_index` for the product are left dangling
-    /// only if the product is re-seeded; tests do not exercise that path.
+    /// Resets counters and clears that product's reservations. On re-seed,
+    /// stale entries in `reservation_index` that pointed at this product
+    /// are removed so the index does not leak across product generations.
     pub fn seed_product(&self, product_id: &str, total_stock: u32) {
+        // Drop any stale index entries pointing at this product BEFORE
+        // we install the fresh state, so concurrent readers never see a
+        // mix of "fresh product, stale index". `retain` holds only the
+        // DashMap shard locks — never the product mutex.
+        self.reservation_index
+            .retain(|_, pid| pid.as_str() != product_id);
+
         self.products.insert(
             product_id.to_owned(),
             Arc::new(Mutex::new(ProductState::new(total_stock))),

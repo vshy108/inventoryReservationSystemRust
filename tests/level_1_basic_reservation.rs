@@ -59,3 +59,12 @@ fn l1_d_unknown_product_returns_product_not_found() {
 
     assert_eq!(err, ReservationError::ProductNotFound);
 }
+
+#[test]
+fn default_constructor_matches_new() {
+    // `Default` is provided so callers that take `T: Default` (e.g. test
+    // harnesses, builders) can construct a service without naming `new`.
+    let svc = ReservationService::default();
+    svc.seed_product("sku-default", 1);
+    assert_eq!(svc.get_available_stock("sku-default").unwrap(), 1);
+}

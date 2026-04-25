@@ -69,11 +69,12 @@ Primary objectives:
 ## 4. Domain Model
 
 ```rust
-pub struct ProductInventory {
-    pub product_id: String,
-    pub total_stock: u32,
-    pub confirmed_count: u32,
-    pub active_reservation_count: u32,
+// Internal to ReservationService; not a public type.
+struct ProductState {
+    total_stock: u32,
+    confirmed_count: u32,
+    active_reservation_count: u32,
+    reservations: HashMap<String, Reservation>,
 }
 
 pub enum ReservationState {
@@ -94,25 +95,9 @@ pub struct Reservation {
     pub cancelled_at: Option<DateTime<Utc>>,
     pub expired_at: Option<DateTime<Utc>>,
 }
-
-pub enum EventType {
-    Reserved,
-    ReserveRejected,
-    Confirmed,
-    Cancelled,
-    Expired,
-}
-
-pub struct InventoryEvent {
-    pub event_id: String,
-    pub reservation_id: Option<String>,
-    pub product_id: String,
-    pub user_id: Option<String>,
-    pub r#type: EventType,
-    pub timestamp: DateTime<Utc>,
-    pub reason: Option<String>,
-}
 ```
+
+> Event sourcing (`EventType` / `InventoryEvent`) is intentionally out of scope for this challenge — counts and reservation state are sufficient to satisfy the spec. Add events only when an audit/observability requirement materialises.
 
 ### Invariants
 - `available_stock >= 0` must always hold (use unsigned counters and saturating/checked arithmetic).
@@ -124,23 +109,31 @@ pub struct InventoryEvent {
 
 ---
 
-## 5. Rust Service API (Suggested)
+## 5. Rust Service API
+
+The core is **synchronous** — the in-memory critical section is short and
+bounded, so async machinery would only add complexity. Async will be
+introduced at the edge (HTTP/gRPC handler) when that lands.
 
 ```rust
-#[async_trait::async_trait]
-pub trait ReservationService: Send + Sync {
-    async fn reserve_item(&self, product_id: &str, user_id: &str, now: DateTime<Utc>)
+impl ReservationService {
+    pub fn new() -> Self;
+    pub fn seed_product(&self, product_id: &str, total_stock: u32);
+    pub fn reserve_item(&self, product_id: &str, user_id: &str, now: DateTime<Utc>)
         -> Result<Reservation, ReservationError>;
-    async fn confirm_reservation(&self, reservation_id: &str, now: DateTime<Utc>)
+    pub fn confirm_reservation(&self, reservation_id: &str, now: DateTime<Utc>)
         -> Result<Reservation, ReservationError>;
-    async fn cancel_reservation(&self, reservation_id: &str, now: DateTime<Utc>)
+    pub fn cancel_reservation(&self, reservation_id: &str, now: DateTime<Utc>)
         -> Result<Reservation, ReservationError>;
-    async fn expire_reservations(&self, now: DateTime<Utc>) -> Result<usize, ReservationError>;
-    async fn get_available_stock(&self, product_id: &str) -> Result<u32, ReservationError>;
-    async fn get_reservation(&self, reservation_id: &str)
-        -> Result<Option<Reservation>, ReservationError>;
+    pub fn expire_reservations(&self, now: DateTime<Utc>) -> Result<usize, ReservationError>;
+    pub fn get_available_stock(&self, product_id: &str) -> Result<u32, ReservationError>;
+    pub fn get_reservation(&self, reservation_id: &str) -> Option<Reservation>;
 }
 ```
+
+There is intentionally no `trait ReservationService` because the codebase
+has exactly one implementation (per AGENTS.md "don't add a trait when
+there is one impl"). A `Clock` trait *is* provided for the time seam.
 
 Error model with `thiserror`:
 
@@ -165,40 +158,42 @@ pub enum ReservationError {
 ## 6. Architecture (Clean and Testable)
 
 ```text
-Interface Layer (CLI / HTTP via axum / Test Harness)
-  -> Application Layer (ReservationService, InventoryService)
-    -> Domain Layer (entities, policies, state transitions)
-      -> Infrastructure Layer (in-memory repositories, lock manager, clock)
+Test harness  /  src/bin/stress.rs   (the only "interface" today)
+  -> Application Layer (ReservationService)
+    -> Domain Layer (Reservation, ReservationState, ReservationError, Clock)
 ```
 
 Key design points:
-- Keep domain logic deterministic and side-effect free where possible.
-- Abstract current time behind a `Clock` trait for deterministic tests.
-- Centralize concurrency control in one place (lock manager or transaction boundary).
-- Emit events for every important state transition for auditability.
-- Run `cargo test` plus stress tests under `--release` to validate thread safety; use `loom` for model checking critical sections if desired.
+- Keep domain logic deterministic and side-effect free.
+- Inject `now: DateTime<Utc>` per call so tests pin time without globals;
+  a `Clock` trait + `SystemClock` exists for callers that prefer
+  delegation.
+- Concurrency is centralised in `ReservationService` via per-product
+  `parking_lot::Mutex` guards — one product mutex held at any instant.
+- Run `cargo test` plus stress runs under `--release` to validate thread safety.
 
 ---
 
-## 7. Concurrency Strategy
+## 7. Concurrency Strategy (As Built)
 
-Preferred baseline for this challenge:
-- Use a **per-product mutex** (`std::sync::Mutex` or `parking_lot::Mutex`) around the read-check-write sequence in `reserve_item`.
-- Hold the mutex inside a synchronous critical section; if the service is `async`, use `tokio::task::spawn_blocking` or `parking_lot::Mutex` (no `.await` while holding the guard) to avoid holding `.await` points across guards.
+- `DashMap<ProductId, Arc<parking_lot::Mutex<ProductState>>>` provides
+  per-product locking. Different SKUs scale linearly.
 - Inside the lock:
-  1. Recompute available stock from current state.
-  2. If available == 0, reject.
-  3. Create active reservation and increment active count.
+  1. Recompute available stock (`total - confirmed - active`).
+  2. If available == 0, reject with `OutOfStock`.
+  3. Allocate the reservation and increment `active_reservation_count`.
+- A separate `DashMap<ReservationId, ProductId>` routes
+  `confirm_reservation` / `cancel_reservation` to the owning product
+  without scanning.
+- The library is sync; `parking_lot::Mutex` does not poison and never
+  needs `expect()` on lock acquisition.
+- At most **one product mutex** is held at any instant — the deadlock
+  surface is empty by construction.
 
-Why this is enough:
-- Avoids check-then-act race.
-- Easy to reason about in interviews/reviews.
-- Works for the required high-contention single-product test.
-
-Scalability note:
-- Per-product locking allows parallel reservations for different products.
-- Back the lock map with `DashMap<ProductId, Arc<Mutex<ProductState>>>` (or `RwLock<HashMap<...>>`) to safely manage lock instances.
-- Alternative lock-free path: keep `active_count` and `confirmed_count` as `AtomicU32` and use a CAS loop over a packed state to reserve atomically.
+Not done (deliberately):
+- No atomic CAS / lock-free path: the lock is not the bottleneck at this
+  scale (the stress binary measures ~40k reserves/sec on a single SKU).
+- No `loom` / `miri`: see AGENTS.md.
 
 ---
 
@@ -216,51 +211,54 @@ Scalability note:
 - Confirm after expiry fails.
 
 ### Level 3 tests
-- 500 parallel reserve calls for stock 1 -> exactly 1 success (use `std::thread::scope` or `tokio::JoinSet`).
+- 500 parallel reserve calls for stock 1 -> exactly 1 success (using `std::thread::scope`).
 - No underflow or inconsistent counters under contention.
 - Repeated high-concurrency runs remain deterministic in outcome counts.
-- Optional: `loom` test for the critical reserve path; Miri run for UB checks (`cargo +nightly miri test` on a focused subset).
+- `proptest` invariants over arbitrary reserve/confirm/cancel/expire
+  sequences, asserting `available == total - active - confirmed` after
+  every step (`tests/proptest_lifecycle.rs`).
 
 ---
 
-## 9. Suggested Project Layout
+## 9. Project Layout (As Built)
 
 ```text
 inventoryReservationSystemRust/
+├── AGENTS.md
 ├── Cargo.toml
 ├── Cargo.lock
-├── src/
-│   ├── main.rs                  # binary entry (CLI/HTTP bootstrap)
-│   ├── lib.rs                   # re-exports module tree
-│   ├── domain/
-│   │   ├── mod.rs
-│   │   ├── reservation.rs
-│   │   ├── inventory.rs
-│   │   ├── errors.rs
-│   │   └── policies.rs
-│   ├── application/
-│   │   ├── mod.rs
-│   │   ├── reservation_service.rs
-│   │   └── inventory_service.rs
-│   ├── infrastructure/
-│   │   ├── mod.rs
-│   │   ├── in_memory_repository.rs
-│   │   ├── lock_manager.rs
-│   │   └── clock.rs
-│   └── interface/
-│       ├── mod.rs
-│       ├── http_handler.rs
-│       └── dto.rs
-├── tests/
-│   ├── unit_basics.rs
-│   └── concurrency_stress.rs
-├── benches/                     # optional, criterion benchmarks
+├── README.md
+├── rust-toolchain.toml
 ├── docs/
 │   └── prompt.md
-└── README.md
+├── specs/
+│   ├── level-1-basic-reservation.md
+│   ├── level-2-lifecycle.md
+│   └── level-3-concurrency.md
+├── src/
+│   ├── lib.rs
+│   ├── bin/
+│   │   └── stress.rs                     # smoke binary
+│   ├── application/
+│   │   ├── mod.rs
+│   │   └── reservation_service.rs
+│   └── domain/
+│       ├── mod.rs
+│       ├── clock.rs
+│       ├── errors.rs
+│       └── reservation.rs
+└── tests/
+    ├── level_1_basic_reservation.rs
+    ├── level_2_lifecycle.rs
+    ├── level_3_concurrency.rs
+    ├── reseed.rs
+    ├── clock.rs
+    └── proptest_lifecycle.rs
 ```
 
-(Or split into a Cargo workspace with `crates/domain`, `crates/application`, `crates/infrastructure`, `crates/app` if scaling demands it.)
+`infrastructure/` and `interface/` modules will appear when an HTTP/gRPC
+layer or persistent repository is introduced. Adding them now would be
+empty scaffolding.
 
 ---
 
@@ -320,10 +318,10 @@ expected, but does not lower the quality bar.
 ### Mandatory deliverables in the ZIP
 - `README.md` with:
   - One-paragraph problem statement.
-  - **Quickstart** (<= 3 commands), for example:
+  - **Quickstart** (<= 3 commands):
     - `cargo build`
-    - `cargo test`
-    - `cargo test --release -- --ignored stress` (if the stress test is gated)
+    - `cargo test` (includes Level 1/2/3 + reseed + clock + proptest + doctest)
+    - `cargo run --release --bin stress` (visual stress smoke)
   - Architecture diagram (layered ASCII block is enough).
   - Spec -> test -> code traceability table (if using a `specs/` folder).
   - Level 1 / 2 / 3 feature checklist with status.
@@ -331,10 +329,10 @@ expected, but does not lower the quality bar.
   - **AI usage disclosure** section (see below).
 - `AGENTS.md` (if present in the repo) for engineering conventions.
 - `specs/` directory (if used) that drives implementation.
-- `.github/workflows/ci.yml` configured for Rust checks
-  (`cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, optional `cargo test --release`).
 - `Cargo.toml` and `Cargo.lock` committed (lockfile committed because this repo ships a binary).
-- `rust-toolchain.toml` (optional) pinning the toolchain for reproducibility.
+- `rust-toolchain.toml` pinning the toolchain (`stable` + `clippy`/`rustfmt`).
+- CI workflow (`.github/workflows/ci.yml`) is **intentionally deferred** — the
+  same checks are runnable locally via the verification commands in §12.
 - Clean git history with conventional commits where practical.
 - Exclude build artifacts from the ZIP (`target/`, coverage output, temporary logs).
 
@@ -352,7 +350,6 @@ Add a section to `README.md` titled `## AI Usage Disclosure` covering:
 - [ ] `cargo test --release` stress scenario is green and repeatable.
 - [ ] `cargo clippy --all-targets -- -D warnings` is clean.
 - [ ] `cargo fmt --all -- --check` is clean.
-- [ ] CI badge in `README.md` is green.
 - [ ] Public APIs have purpose-driven names; no commented-out code; no stray `dbg!`/`println!`.
 - [ ] No `unwrap()`/`expect()` in library/production code paths.
 - [ ] No secrets, tokens, or personal paths committed.

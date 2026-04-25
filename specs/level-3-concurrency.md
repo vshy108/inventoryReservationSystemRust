@@ -26,6 +26,6 @@ Guarantee that under high contention the service never oversells, never underflo
 - `loom` model checking (optional, gated behind a feature flag if added later).
 
 ## Design notes
-- Concurrency primitive: a single `parking_lot::Mutex<State>` already serializes the check-then-act in `reserve_item`, which is sufficient for correctness. The spec keeps the door open for per-product locking later (`DashMap<ProductId, Arc<Mutex<ProductState>>>`) to allow parallel reserves across different SKUs without affecting the safety guarantees tested here.
+- Concurrency primitive: per-product `parking_lot::Mutex<ProductState>` guards backed by a `DashMap<ProductId, Arc<Mutex<ProductState>>>`. This was the chosen final design (delivered in `refactor(l3): per-product locking with DashMap`), allowing parallel reserves across different SKUs while serializing the check-then-act for any single SKU. At most one product mutex is held at any instant, so the deadlock surface is empty by construction.
 - Tests run as `#[ignore]`-free integration tests so a default `cargo test` exercises them. They use `std::thread::scope` (no async runtime needed), and assert both the count of successes and the post-hoc state of the service.
 - The repeat-test (L3-C) defends against flaky outcomes that would indicate races slipping through.

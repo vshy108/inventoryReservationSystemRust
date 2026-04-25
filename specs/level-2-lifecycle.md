@@ -53,5 +53,5 @@ ReservationService::get_available_stock(
 
 ## Design notes
 - Reservations are stored in a second map keyed by `reservation_id`, alongside the per-product counters. The counters are the source of truth for available stock; the reservation map is the source of truth for lifecycle state.
-- Time is passed in by the caller (no `Clock` trait yet — we already inject `now`, which keeps L2 tests deterministic without extra abstraction). A `Clock` trait will be introduced when the HTTP layer needs a default `now`.
+- Time is passed in by the caller (no `Clock` trait yet — we already inject `now`, which keeps L2 tests deterministic without extra abstraction). A `Clock` trait + `SystemClock` were subsequently added in `src/domain/clock.rs` as a seam for callers that want to delegate "what time is it?"; the per-call `now` API remains the canonical contract.
 - Confirm-after-expiry returns `ReservationExpired` *and* mutates state to Expired so callers cannot ride a stale Active reservation by retrying.

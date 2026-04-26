@@ -43,8 +43,9 @@ threads:        1000
 stock:          100
 accepted:       100
 out_of_stock:   900
-elapsed:        ~24 ms
-throughput:     ~41 000 reserves/sec
+available_left: 0
+elapsed:        ~22 ms
+throughput:     ~46 000 reserves/sec
 ```
 
 Reproduce with `cargo run --release --bin stress`.

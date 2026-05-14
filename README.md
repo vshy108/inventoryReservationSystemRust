@@ -22,6 +22,8 @@ cargo cov-lib                         # library coverage summary (requires cargo
 cargo doc --no-deps --open            # crate-level rustdoc
 ```
 
+For the compact command, invariant, and extension-rule reference, see [CHEATSHEET.md](CHEATSHEET.md).
+
 ## Test coverage
 
 Library coverage (excluding the smoke binary `src/bin/stress.rs`):

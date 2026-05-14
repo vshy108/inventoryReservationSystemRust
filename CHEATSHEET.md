@@ -6,7 +6,8 @@
 cargo build
 cargo test
 cargo test --release
-cargo run --release --bin stress
+cargo bench                           # hot-SKU and multi-SKU contention benchmarks (criterion)
+cargo run --release --bin stress      # smoke: 1000 threads racing for 100 stock
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo cov-lib

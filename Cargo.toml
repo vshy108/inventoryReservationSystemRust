@@ -10,4 +10,9 @@ parking_lot = "0.12"
 thiserror = "2"
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"
+
+[[bench]]
+name = "contention"
+harness = false

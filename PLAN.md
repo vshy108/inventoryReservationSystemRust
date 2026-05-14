@@ -22,9 +22,9 @@ This plan records future work for the Rust reservation service. Follow `AGENTS.m
 
 ## S4 — Contention Benchmark
 
-- [ ] Add a repeatable benchmark or stress report for hot-SKU and multi-SKU contention.
-- [ ] Compare debug, release, and stress binary results without adding unsafe or atomics by default.
-- [ ] Document when a different concurrency design would be justified.
+- [x] Add a repeatable benchmark or stress report for hot-SKU and multi-SKU contention.
+- [x] Compare debug, release, and stress binary results without adding unsafe or atomics by default.
+- [x] Document when a different concurrency design would be justified.
 
 ## S5 — Persistence ADR
 

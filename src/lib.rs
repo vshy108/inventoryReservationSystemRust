@@ -23,4 +23,4 @@ pub mod application;
 pub mod domain;
 
 pub use application::ReservationService;
-pub use domain::{Clock, Reservation, ReservationError, ReservationState, SystemClock};
+pub use domain::{Clock, Reservation, ReservationError, ReservationState, SystemClock, TraceEvent, TraceSubscriber};

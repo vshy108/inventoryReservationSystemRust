@@ -16,9 +16,9 @@ This plan records future work for the Rust reservation service. Follow `AGENTS.m
 
 ## S3 — Reservation Trace Events
 
-- [ ] Define domain-level trace events for reserve, confirm, cancel, expire, and rejection paths.
-- [ ] Keep event collection behind a small port so the core does not depend on logging or I/O.
-- [ ] Verify event order and payloads with public service tests.
+- [x] Define domain-level trace events for reserve, confirm, cancel, expire, and rejection paths.
+- [x] Keep event collection behind a small port so the core does not depend on logging or I/O.
+- [x] Verify event order and payloads with public service tests.
 
 ## S4 — Contention Benchmark
 

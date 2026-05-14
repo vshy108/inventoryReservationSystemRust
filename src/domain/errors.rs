@@ -2,7 +2,7 @@
 ///
 /// Mapped to HTTP/gRPC error codes by interface adapters; library
 /// callers should match exhaustively to react to each case.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum ReservationError {
     /// `available_stock == 0` for the requested product at the time of
     /// the call. Returned by `reserve_item` and never by lifecycle ops.

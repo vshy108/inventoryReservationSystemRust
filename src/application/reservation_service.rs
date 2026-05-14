@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -6,7 +7,7 @@ use chrono::{DateTime, Duration, Utc};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 
-use crate::domain::{Reservation, ReservationError, ReservationState};
+use crate::domain::{NoopSubscriber, Reservation, ReservationError, ReservationState, TraceEvent, TraceSubscriber};
 
 /// Reservation hold time per spec §2.
 const RESERVATION_HOLD: Duration = Duration::minutes(2);
@@ -58,11 +59,25 @@ type ProductLock = Arc<Mutex<ProductState>>;
 ///   global mutex.
 /// - Lock discipline: at most one product mutex is held at any instant
 ///   (the index is read-only by the time the product mutex is taken).
-#[derive(Debug)]
+///
+/// Trace events are emitted after each operation via the injected [`TraceSubscriber`].
+/// The default is [`NoopSubscriber`]; inject a recorder with [`Self::with_subscriber`].
 pub struct ReservationService {
     products: DashMap<String, ProductLock>,
     reservation_index: DashMap<String, String>,
     next_id: AtomicU64,
+    subscriber: Arc<dyn TraceSubscriber>,
+}
+
+// Manual Debug: dyn TraceSubscriber is not Debug; skip the subscriber field.
+impl fmt::Debug for ReservationService {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReservationService")
+            .field("products", &self.products)
+            .field("reservation_index", &self.reservation_index)
+            .field("next_id", &self.next_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for ReservationService {
@@ -73,12 +88,38 @@ impl Default for ReservationService {
 
 impl ReservationService {
     /// Constructs an empty service with no products registered.
+    /// Events are discarded by default; inject a subscriber with [`Self::with_subscriber`].
     pub fn new() -> Self {
         Self {
             products: DashMap::new(),
             reservation_index: DashMap::new(),
             next_id: AtomicU64::new(0),
+            subscriber: Arc::new(NoopSubscriber),
         }
+    }
+
+    /// Replaces the trace subscriber and returns `self` for builder-style setup.
+    ///
+    /// ```
+    /// use std::sync::{Arc, Mutex};
+    /// use inventory_reservation::{ReservationService, TraceEvent, TraceSubscriber};
+    ///
+    /// #[derive(Debug)]
+    /// struct Recorder(Mutex<Vec<TraceEvent>>);
+    /// impl TraceSubscriber for Recorder {
+    ///     fn record(&self, e: TraceEvent) { self.0.lock().unwrap().push(e); }
+    /// }
+    ///
+    /// let rec = Arc::new(Recorder(Mutex::new(vec![])));
+    /// let svc = ReservationService::new().with_subscriber(Arc::clone(&rec) as Arc<dyn TraceSubscriber>);
+    /// ```
+    pub fn with_subscriber(mut self, subscriber: Arc<dyn TraceSubscriber>) -> Self {
+        self.subscriber = subscriber;
+        self
+    }
+
+    fn emit(&self, event: TraceEvent) {
+        self.subscriber.record(event);
     }
 
     /// Registers (or re-registers) a product with the given total stock.
@@ -112,36 +153,53 @@ impl ReservationService {
         user_id: &str,
         now: DateTime<Utc>,
     ) -> Result<Reservation, ReservationError> {
-        let lock = self.product_lock(product_id)?;
-        let mut product = lock.lock();
+        // Lock is released when the closure returns; event is emitted after.
+        let result = (|| -> Result<Reservation, ReservationError> {
+            let lock = self.product_lock(product_id)?;
+            let mut product = lock.lock();
 
-        if product.available() == 0 {
-            return Err(ReservationError::OutOfStock);
+            if product.available() == 0 {
+                return Err(ReservationError::OutOfStock);
+            }
+
+            product.active_reservation_count += 1;
+
+            let reservation = Reservation {
+                reservation_id: self.next_reservation_id(),
+                product_id: product_id.to_owned(),
+                user_id: user_id.to_owned(),
+                state: ReservationState::Active,
+                created_at: now,
+                expires_at: now + RESERVATION_HOLD,
+                confirmed_at: None,
+                cancelled_at: None,
+                expired_at: None,
+            };
+
+            product
+                .reservations
+                .insert(reservation.reservation_id.clone(), reservation.clone());
+            // Index insert is safe to do while still holding the product lock:
+            // DashMap takes only its own per-shard lock, never the product mutex.
+            self.reservation_index
+                .insert(reservation.reservation_id.clone(), product_id.to_owned());
+
+            Ok(reservation)
+        })();
+
+        match &result {
+            Ok(r) => self.emit(TraceEvent::Reserved {
+                reservation_id: r.reservation_id.clone(),
+                product_id: r.product_id.clone(),
+                user_id: r.user_id.clone(),
+            }),
+            Err(e) => self.emit(TraceEvent::ReserveFailed {
+                product_id: product_id.to_owned(),
+                user_id: user_id.to_owned(),
+                error: e.clone(),
+            }),
         }
-
-        product.active_reservation_count += 1;
-
-        let reservation = Reservation {
-            reservation_id: self.next_reservation_id(),
-            product_id: product_id.to_owned(),
-            user_id: user_id.to_owned(),
-            state: ReservationState::Active,
-            created_at: now,
-            expires_at: now + RESERVATION_HOLD,
-            confirmed_at: None,
-            cancelled_at: None,
-            expired_at: None,
-        };
-
-        product
-            .reservations
-            .insert(reservation.reservation_id.clone(), reservation.clone());
-        // Index insert is safe to do while still holding the product lock:
-        // DashMap takes only its own per-shard lock, never the product mutex.
-        self.reservation_index
-            .insert(reservation.reservation_id.clone(), product_id.to_owned());
-
-        Ok(reservation)
+        result
     }
 
     /// Transitions an `Active` reservation to `Confirmed`.
@@ -158,47 +216,60 @@ impl ReservationService {
         reservation_id: &str,
         now: DateTime<Utc>,
     ) -> Result<Reservation, ReservationError> {
-        let lock = self.lock_for_reservation(reservation_id)?;
-        let mut product = lock.lock();
+        let result = (|| -> Result<Reservation, ReservationError> {
+            let lock = self.lock_for_reservation(reservation_id)?;
+            let mut product = lock.lock();
 
-        // Snapshot just what's needed to decide the transition, so the
-        // mutable borrow of `product.reservations` is released before we
-        // mutate sibling fields on `product`.
-        let (state, expires_at) = {
+            // Snapshot just what's needed to decide the transition, so the
+            // mutable borrow of `product.reservations` is released before we
+            // mutate sibling fields on `product`.
+            let (state, expires_at) = {
+                let r = product
+                    .reservations
+                    .get(reservation_id)
+                    .ok_or(ReservationError::ReservationNotFound)?;
+                (r.state, r.expires_at)
+            };
+
+            match state {
+                ReservationState::Active => {}
+                ReservationState::Confirmed
+                | ReservationState::Cancelled
+                | ReservationState::Expired => {
+                    return Err(ReservationError::ReservationAlreadyFinalized);
+                }
+            }
+
+            if now > expires_at {
+                // Past expiry: mark Expired, release stock, and report
+                // ReservationExpired so callers cannot ride a stale Active state.
+                release_active_to_expired(&mut product, reservation_id, now);
+                return Err(ReservationError::ReservationExpired);
+            }
+
+            // Active -> Confirmed: a held unit becomes a confirmed sale; the
+            // total occupied stock count is unchanged.
+            product.active_reservation_count -= 1;
+            product.confirmed_count += 1;
             let r = product
                 .reservations
-                .get(reservation_id)
+                .get_mut(reservation_id)
                 .ok_or(ReservationError::ReservationNotFound)?;
-            (r.state, r.expires_at)
-        };
+            r.state = ReservationState::Confirmed;
+            r.confirmed_at = Some(now);
+            Ok(r.clone())
+        })();
 
-        match state {
-            ReservationState::Active => {}
-            ReservationState::Confirmed
-            | ReservationState::Cancelled
-            | ReservationState::Expired => {
-                return Err(ReservationError::ReservationAlreadyFinalized);
-            }
+        match &result {
+            Ok(_) => self.emit(TraceEvent::Confirmed {
+                reservation_id: reservation_id.to_owned(),
+            }),
+            Err(e) => self.emit(TraceEvent::ConfirmFailed {
+                reservation_id: reservation_id.to_owned(),
+                error: e.clone(),
+            }),
         }
-
-        if now > expires_at {
-            // Past expiry: mark Expired, release stock, and report
-            // ReservationExpired so callers cannot ride a stale Active state.
-            release_active_to_expired(&mut product, reservation_id, now);
-            return Err(ReservationError::ReservationExpired);
-        }
-
-        // Active -> Confirmed: a held unit becomes a confirmed sale; the
-        // total occupied stock count is unchanged.
-        product.active_reservation_count -= 1;
-        product.confirmed_count += 1;
-        let r = product
-            .reservations
-            .get_mut(reservation_id)
-            .ok_or(ReservationError::ReservationNotFound)?;
-        r.state = ReservationState::Confirmed;
-        r.confirmed_at = Some(now);
-        Ok(r.clone())
+        result
     }
 
     /// Transitions an `Active` reservation to `Cancelled`, releasing the held unit.
@@ -212,32 +283,45 @@ impl ReservationService {
         reservation_id: &str,
         now: DateTime<Utc>,
     ) -> Result<Reservation, ReservationError> {
-        let lock = self.lock_for_reservation(reservation_id)?;
-        let mut product = lock.lock();
+        let result = (|| -> Result<Reservation, ReservationError> {
+            let lock = self.lock_for_reservation(reservation_id)?;
+            let mut product = lock.lock();
 
-        let state = product
-            .reservations
-            .get(reservation_id)
-            .ok_or(ReservationError::ReservationNotFound)?
-            .state;
+            let state = product
+                .reservations
+                .get(reservation_id)
+                .ok_or(ReservationError::ReservationNotFound)?
+                .state;
 
-        match state {
-            ReservationState::Active => {}
-            ReservationState::Confirmed
-            | ReservationState::Cancelled
-            | ReservationState::Expired => {
-                return Err(ReservationError::ReservationAlreadyFinalized);
+            match state {
+                ReservationState::Active => {}
+                ReservationState::Confirmed
+                | ReservationState::Cancelled
+                | ReservationState::Expired => {
+                    return Err(ReservationError::ReservationAlreadyFinalized);
+                }
             }
-        }
 
-        product.active_reservation_count -= 1;
-        let r = product
-            .reservations
-            .get_mut(reservation_id)
-            .ok_or(ReservationError::ReservationNotFound)?;
-        r.state = ReservationState::Cancelled;
-        r.cancelled_at = Some(now);
-        Ok(r.clone())
+            product.active_reservation_count -= 1;
+            let r = product
+                .reservations
+                .get_mut(reservation_id)
+                .ok_or(ReservationError::ReservationNotFound)?;
+            r.state = ReservationState::Cancelled;
+            r.cancelled_at = Some(now);
+            Ok(r.clone())
+        })();
+
+        match &result {
+            Ok(_) => self.emit(TraceEvent::Cancelled {
+                reservation_id: reservation_id.to_owned(),
+            }),
+            Err(e) => self.emit(TraceEvent::CancelFailed {
+                reservation_id: reservation_id.to_owned(),
+                error: e.clone(),
+            }),
+        }
+        result
     }
 
     /// Sweeps every product, transitioning `Active` reservations whose
@@ -247,7 +331,7 @@ impl ReservationService {
     /// Each product is processed under only its own lock, so SKUs can be
     /// swept without blocking each other.
     pub fn expire_reservations(&self, now: DateTime<Utc>) -> Result<usize, ReservationError> {
-        let mut expired = 0usize;
+        let mut expired_ids: Vec<String> = Vec::new();
         // Each product is processed under only its own lock, so different
         // SKUs can be swept in parallel by callers if needed.
         for entry in self.products.iter() {
@@ -258,12 +342,18 @@ impl ReservationService {
                 .filter(|(_, r)| r.state == ReservationState::Active && now > r.expires_at)
                 .map(|(id, _)| id.clone())
                 .collect();
-            for id in candidate_ids {
-                release_active_to_expired(&mut product, &id, now);
-                expired += 1;
+            for id in &candidate_ids {
+                release_active_to_expired(&mut product, id, now);
             }
+            expired_ids.extend(candidate_ids);
+            // Lock released here before emitting events.
         }
-        Ok(expired)
+        // Emit Expired events after all locks are released.
+        let count = expired_ids.len();
+        for id in expired_ids {
+            self.emit(TraceEvent::Expired { reservation_id: id });
+        }
+        Ok(count)
     }
 
     /// Returns a snapshot of the reservation, or `None` if the id is unknown.

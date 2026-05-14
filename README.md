@@ -22,7 +22,7 @@ cargo cov-lib                         # library coverage summary (requires cargo
 cargo doc --no-deps --open            # crate-level rustdoc
 ```
 
-For the compact command, invariant, and extension-rule reference, see [CHEATSHEET.md](CHEATSHEET.md).
+For follow-up work and compact references, see [PLAN.md](PLAN.md) and [CHEATSHEET.md](CHEATSHEET.md).
 
 ## Test coverage
 

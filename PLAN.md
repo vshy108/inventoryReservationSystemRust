@@ -28,6 +28,6 @@ This plan records future work for the Rust reservation service. Follow `AGENTS.m
 
 ## S5 — Persistence ADR
 
-- [ ] Decide whether a durable adapter belongs in this repo or should remain out of scope.
-- [ ] Capture required invariants for reloading products, reservations, and the routing index.
-- [ ] Add tests before any adapter implementation.
+- [x] Decide whether a durable adapter belongs in this repo or should remain out of scope.
+- [x] Capture required invariants for reloading products, reservations, and the routing index.
+- [x] Add tests before any adapter implementation.

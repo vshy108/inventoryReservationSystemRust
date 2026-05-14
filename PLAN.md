@@ -10,9 +10,9 @@ This plan records future work for the Rust reservation service. Follow `AGENTS.m
 
 ## S2 — HTTP Adapter Spec
 
-- [ ] Add a spec for an optional HTTP boundary that preserves the sync core and validates all input at the edge.
-- [ ] Define DTOs, error mapping, and endpoint semantics before adding dependencies.
-- [ ] Verify first with failing adapter tests, then minimal implementation.
+- [x] Add a spec for an optional HTTP boundary that preserves the sync core and validates all input at the edge.
+- [x] Define DTOs, error mapping, and endpoint semantics before adding dependencies.
+- [x] Verify first with failing adapter tests, then minimal implementation.
 
 ## S3 — Reservation Trace Events
 

@@ -4,9 +4,9 @@ This plan records future work for the Rust reservation service. Follow `AGENTS.m
 
 ## S1 — CI Workflow
 
-- [ ] Add `.github/workflows/ci.yml` for the same local gates documented in the README.
-- [ ] Run `cargo build`, `cargo test`, `cargo test --release`, `cargo clippy --all-targets -- -D warnings`, and `cargo fmt --all -- --check`.
-- [ ] Keep the intentionally deferred README checklist item in sync with the actual workflow.
+- [x] Add `.github/workflows/ci.yml` for the same local gates documented in the README.
+- [x] Run `cargo build`, `cargo test`, `cargo test --release`, `cargo clippy --all-targets -- -D warnings`, and `cargo fmt --all -- --check`.
+- [x] Keep the intentionally deferred README checklist item in sync with the actual workflow.
 
 ## S2 — HTTP Adapter Spec
 

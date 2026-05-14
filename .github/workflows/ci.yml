@@ -43,8 +43,14 @@ jobs:
       - name: Clippy (all targets, deny warnings)
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Test
+      - name: Build
+        run: cargo build --all-targets
+
+      - name: Test (debug)
         run: cargo test --all-targets
+
+      - name: Test (release)
+        run: cargo test --release --all-targets
 
       - name: Doc tests
         run: cargo test --doc

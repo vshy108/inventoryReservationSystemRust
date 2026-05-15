@@ -4,6 +4,15 @@ Prevents overselling during high-concurrency flash sales. The service holds inve
 
 Engineering conventions for contributors (human or AI) are documented in [AGENTS.md](AGENTS.md). The high-level plan lives in [docs/prompt.md](docs/prompt.md).
 
+## Repo Metadata
+
+- Repo start date: 2026-04-25
+- Related tech stack versions: Rust stable
+
+## Why This Repo Matters
+
+This repo matters because it models the same reservation domain in Rust, showing ownership, explicit errors, and correctness-focused service design.
+
 ## Quickstart
 
 ```sh

@@ -1,5 +1,7 @@
 # Inventory Reservation System (Rust)
 
+Latest parity evidence: [`docs/parity-evidence-2026-05-18.md`](docs/parity-evidence-2026-05-18.md).
+
 Prevents overselling during high-concurrency flash sales. The service holds inventory state in memory, exposes a small reservation API, and guarantees that at most one user wins the last unit even under hundreds of simultaneous requests.
 
 Engineering conventions for contributors (human or AI) are documented in [AGENTS.md](AGENTS.md). The high-level plan lives in [docs/prompt.md](docs/prompt.md).
